@@ -49,12 +49,15 @@
 -define(WRITE_OPTIONS, []).
 -define(OPEN_OPTIONS, [{create_if_missing, true}]).
 
--type msg_ref_delta_gen(A) :: rabbit_msg_store_behaviour:msg_ref_delta_gen().
+-include_lib("rabbit_common/include/rabbit.hrl").
+
+-type msg_ref_delta_gen(A) :: rabbit_msg_store_behaviour:msg_ref_delta_gen(A).
 -type maybe_msg_id_fun() :: rabbit_msg_store_behaviour:maybe_msg_id_fun().
 -type maybe_close_fds_fun() :: rabbit_msg_store_behaviour:maybe_close_fds_fun().
 -type server() :: rabbit_msg_store_behaviour:server().
 -type client_ref() :: rabbit_msg_store_behaviour:client_ref().
 -type msg() :: rabbit_msg_store_behaviour:msg().
+-type client_msstate() :: #client_state{}.
 
 
 %% ====================================
@@ -328,13 +331,14 @@ recover_ref_count(RefCountModule, DB, ClientRefs, Dir, StartupFunState, Name) ->
                         {error, Error} ->
                             Fresh("failed to recover reference counter: ~p", [Error])
                     end;
-                false -> Fresh("recovery terms differ from present", [])
+                _ -> Fresh("recovery terms differ from present", [])
             end
     end.
 
 recount_ref_counter(RefCountModule, Dir, DB, {MsgRefDeltaGen, MsgRefDeltaGenInit}) ->
     {ok, RefCountDB} = start_clean_ref_counter(RefCountModule, Dir),
     ok = count_msg_refs(MsgRefDeltaGen, MsgRefDeltaGenInit, RefCountDB, DB),
+    ok = clean_zero_count(RefCountDB, DB),
     RefCountDB.
 
 count_msg_refs(Gen, Seed, RefCountDB, DB) ->
@@ -351,6 +355,17 @@ count_msg_refs(Gen, Seed, RefCountDB, DB) ->
             end,
             count_msg_refs(Gen, Next, RefCountDB, DB)
     end.
+
+clean_zero_count(RefCountDB, DB) ->
+    eleveldb:fold_keys(DB,
+        fun(MsgId, ok) ->
+            case positive_ref_count(MsgId, RefCountDB) of
+                true  -> ok;
+                false -> ok = do_remove_message(MsgId, DB)
+            end
+        end,
+        ok,
+        ?READ_OPTIONS).
 
 store_recovery_terms(Terms, Dir) ->
     rabbit_file:write_term_file(filename:join(Dir, ?CLEAN_FILENAME), Terms).
@@ -382,7 +397,8 @@ load_ref_counter(RefCountModule, Dir) ->
     end.
 
 start_clean_ref_counter(RefCountModule, Dir) ->
-    {ok, {RefCountModule, RefCountModule:start_clean(Dir)}}.
+    {ok, RefCountState} = RefCountModule:start_clean(Dir),
+    {ok, {RefCountModule, RefCountState}}.
 
 stop_ref_counter({RefCountModule, RefCountState}, Dir) ->
     RefCountModule:save(RefCountState, Dir).
