@@ -233,43 +233,11 @@ handle_cast({client_delete, CRef},
     noreply(clear_client(CRef, State1));
 
 handle_cast({write, CRef, MsgId, Msg, Flow},
-            State = #state { clients           = Clients,
-                             credit_disc_bound = CreditDiscBound }) ->
-    case Flow of
-        flow   -> {CPid, _, _} = dict:fetch(CRef, Clients),
-                  %% We are going to process a message sent by the
-                  %% rabbit_amqqueue_process. Now we are accessing the
-                  %% msg_store process dictionary.
-                  credit_flow:ack(CPid, CreditDiscBound);
-        noflow -> ok
-    end,
-    %% We don't ignore any writes from dying clients, for simplicity.
-    State1 = case positive_ref_count(MsgId, State) of
-        true  ->
-            increase_ref_count(MsgId, State),
-            client_confirm(CRef, gb_sets:singleton(MsgId), written, State);
-        %% If ref_count is 0 or doesn't exist - write a message to the msg store
-        false ->
-        % rabbit_log:error("Write message ~p~n ~p~n from server ~p~n", [MsgId, Msg, State]),
-            write_message(MsgId, Msg, State),
-            increase_ref_count(MsgId, State),
-            client_confirm(CRef, gb_sets:singleton(MsgId), written, State)
-    end,
-    noreply(State1);
+            State) ->
+    do_write(CRef, MsgId, Msg, Flow, State);
 
 handle_cast({remove, CRef, MsgIds}, State) ->
-    %% We remove all the message IDs we receive, so none of them gets ignored.
-    lists:foreach(
-        fun (MsgId) ->
-            case decrease_ref_count(MsgId, State) of
-                I when is_integer(I), I =< 0 ->
-                    ok = delete_ref_count(MsgId, State),
-                    remove_message(MsgId, State);
-                _ -> ok
-            end
-        end,
-        MsgIds),
-    noreply(client_confirm(CRef, gb_sets:from_list(MsgIds), ignored, State)).
+    do_remove(CRef, MsgIds, State).
 
 handle_info({'DOWN', _MRef, process, Pid, _Reason}, State) ->
     %% similar to what happens in
@@ -434,6 +402,43 @@ remove_message(MsgId, #state{ msg_db = MsgDb }) ->
 %% ====================================
 %% Internal helpers
 %% ====================================
+do_write(CRef, MsgId, Msg, Flow, State = #state { clients           = Clients,
+                             credit_disc_bound = CreditDiscBound }) ->
+    case Flow of
+        flow   -> {CPid, _, _} = dict:fetch(CRef, Clients),
+                  %% We are going to process a message sent by the
+                  %% rabbit_amqqueue_process. Now we are accessing the
+                  %% msg_store process dictionary.
+                  credit_flow:ack(CPid, CreditDiscBound);
+        noflow -> ok
+    end,
+    %% We don't ignore any writes from dying clients, for simplicity.
+    State1 = case positive_ref_count(MsgId, State) of
+        true  ->
+            increase_ref_count(MsgId, State),
+            client_confirm(CRef, gb_sets:singleton(MsgId), written, State);
+        %% If ref_count is 0 or doesn't exist - write a message to the msg store
+        false ->
+        % rabbit_log:error("Write message ~p~n ~p~n from server ~p~n", [MsgId, Msg, State]),
+            write_message(MsgId, Msg, State),
+            increase_ref_count(MsgId, State),
+            client_confirm(CRef, gb_sets:singleton(MsgId), written, State)
+    end,
+    noreply(State1).
+
+do_remove(CRef, MsgIds, State) ->
+    %% We remove all the message IDs we receive, so none of them gets ignored.
+    lists:foreach(
+        fun (MsgId) ->
+            case decrease_ref_count(MsgId, State) of
+                I when is_integer(I), I =< 0 ->
+                    ok = delete_ref_count(MsgId, State),
+                    remove_message(MsgId, State);
+                _ -> ok
+            end
+        end,
+        MsgIds),
+    noreply(client_confirm(CRef, gb_sets:from_list(MsgIds), ignored, State)).
 
 noreply(State) ->
     {noreply, State, hibernate}.
