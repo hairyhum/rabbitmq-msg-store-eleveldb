@@ -34,6 +34,8 @@
     credit_disc_bound,
     successfully_recovered,
     clients,
+    client_written_confirms,
+    confirm_timeout,
     dying_clients}).
 -record(client_state, {
     server,
@@ -167,7 +169,7 @@ init([Type, BaseDir, ClientRefs, StartupFunState]) ->
         false -> []
     end,
 
-    Clients = dict:from_list(
+    Clients = maps:from_list(
                 [{CRef, {undefined, undefined, undefined}} ||
                     CRef <- ClientRefs1]),
 
@@ -175,14 +177,16 @@ init([Type, BaseDir, ClientRefs, StartupFunState]) ->
                                           ?CREDIT_DISC_BOUND),
 
     State = #state {
-        dir                    = Dir,
-        msg_db                 = DB,
-        ref_count_db           = RefCountDB,
+        dir                     = Dir,
+        msg_db                  = DB,
+        ref_count_db            = RefCountDB,
         % TODO: maybe use a set
-        dying_clients          = #{},
-        clients                = Clients,
-        successfully_recovered = CleanShutdown,
-        credit_disc_bound      = CreditDiscBound
+        dying_clients           = #{},
+        clients                 = Clients,
+        client_written_confirms = #{},
+        confirm_timeout         = undefined,
+        successfully_recovered  = CleanShutdown,
+        credit_disc_bound       = CreditDiscBound
     },
 
     {ok, State,
@@ -213,7 +217,7 @@ handle_call({new_client_state, CRef, CPid, MsgOnDiskFun, CloseFDsFun}, _From,
                              clients      = Clients,
                              msg_db       = MsgDb,
                              ref_count_db = RefCountDB}) ->
-    Clients1 = dict:store(CRef, {CPid, MsgOnDiskFun, CloseFDsFun}, Clients),
+    Clients1 = maps:put(CRef, {CPid, MsgOnDiskFun, CloseFDsFun}, Clients),
     erlang:monitor(process, CPid),
     reply({Dir, MsgDb, RefCountDB},
           State #state { clients = Clients1 });
@@ -229,7 +233,7 @@ handle_cast({client_dying, CRef},
 
 handle_cast({client_delete, CRef},
             State = #state { clients = Clients }) ->
-    State1 = State #state { clients = dict:erase(CRef, Clients) },
+    State1 = State #state { clients = maps:remove(CRef, Clients) },
     noreply(clear_client(CRef, State1));
 
 handle_cast({write, CRef, MsgId, Msg, Flow},
@@ -238,6 +242,10 @@ handle_cast({write, CRef, MsgId, Msg, Flow},
 
 handle_cast({remove, CRef, MsgIds}, State) ->
     do_remove(CRef, MsgIds, State).
+
+handle_info(timeout, State) ->
+    State1 = send_confirms(State),
+    noreply(State1);
 
 handle_info({'DOWN', _MRef, process, Pid, _Reason}, State) ->
     %% similar to what happens in
@@ -261,7 +269,7 @@ terminate(_Reason, #state { msg_db       = MsgDb,
                             dir          = Dir }) ->
     ok = stop_db(MsgDb, Dir),
     ok = stop_ref_counter(RefCountDB, Dir),
-    case store_recovery_terms([{client_refs, dict:fetch_keys(Clients)},
+    case store_recovery_terms([{client_refs, maps:keys(Clients)},
                                {ref_count_module, ?REFCOUNT_MODULE}], Dir) of
         ok           -> ok;
         {error, RTErr} ->
@@ -404,27 +412,37 @@ remove_message(MsgId, #state{ msg_db = MsgDb }) ->
 %% ====================================
 do_write(CRef, MsgId, Msg, Flow, State = #state { clients           = Clients,
                              credit_disc_bound = CreditDiscBound }) ->
-    case Flow of
-        flow   -> {CPid, _, _} = dict:fetch(CRef, Clients),
-                  %% We are going to process a message sent by the
-                  %% rabbit_amqqueue_process. Now we are accessing the
-                  %% msg_store process dictionary.
-                  credit_flow:ack(CPid, CreditDiscBound);
-        noflow -> ok
-    end,
-    %% We don't ignore any writes from dying clients, for simplicity.
-    State1 = case positive_ref_count(MsgId, State) of
-        true  ->
-            increase_ref_count(MsgId, State),
-            client_confirm(CRef, gb_sets:singleton(MsgId), written, State);
-        %% If ref_count is 0 or doesn't exist - write a message to the msg store
-        false ->
-        % rabbit_log:error("Write message ~p~n ~p~n from server ~p~n", [MsgId, Msg, State]),
-            write_message(MsgId, Msg, State),
-            increase_ref_count(MsgId, State),
-            client_confirm(CRef, gb_sets:singleton(MsgId), written, State)
-    end,
-    noreply(State1).
+    %% Ignore writes from deleted clients
+    case maps:get(CRef, Clients, none) of
+        none         -> noreply(State);
+        {CPid, _, _} ->
+            case Flow of
+                flow   -> %% We are going to process a message sent by the
+                          %% rabbit_amqqueue_process. Now we are accessing the
+                          %% msg_store process dictionary.
+                          credit_flow:ack(CPid, CreditDiscBound);
+                noflow -> ok
+            end,
+            State1 = case increase_ref_count(MsgId, State) of
+                I when I > 1 ->
+                    % It's not the first time we write this message
+                    record_client_confirm(CRef, MsgId, State);
+                    % client_confirm(CRef, gb_sets:singleton(MsgId), written, State);
+                I when I == 1 ->
+                    write_message(MsgId, Msg, State),
+                    record_client_confirm(CRef, MsgId, State);
+                    % client_confirm(CRef, gb_sets:singleton(MsgId), written, State);
+                _ ->
+                    rabbit_log:error("Zero ref count after write!!"),
+                    write_message(MsgId, Msg, State),
+                    record_client_confirm(CRef, MsgId, State)
+            end,
+            State2 = case maps:size(State1#state.client_written_confirms) > 20 of
+                true  -> send_confirms(State1);
+                false -> start_confirm_timeout(State1)
+            end,
+            noreply(State2)
+    end.
 
 do_remove(CRef, MsgIds, State) ->
     %% We remove all the message IDs we receive, so none of them gets ignored.
@@ -499,13 +517,38 @@ open_options() ->
                                         []),
                     ?OPEN_OPTIONS).
 
+record_client_confirm(CRef, MsgId, State = #state{client_written_confirms = CF}) ->
+    CF1 = maps:update_with(CRef, fun(MsgIds) -> gb_sets:add(MsgId, MsgIds) end,
+                           gb_sets:singleton(MsgId), CF),
+    State#state{client_written_confirms = CF1}.
+
+send_confirms(State = #state{client_written_confirms = CF, confirm_timeout = Timeout}) ->
+    stop_confirm_timeout(Timeout),
+    maps:fold(
+        fun(CRef, MsgIds, ok) ->
+            client_confirm(CRef, MsgIds, written, State),
+            ok
+        end,
+        ok,
+        CF),
+    State#state{client_written_confirms = #{}, confirm_timeout = undefined}.
+
+stop_confirm_timeout(undefined) -> ok;
+stop_confirm_timeout(Timeout)   -> timer:cancel(Timeout), ok.
+
+start_confirm_timeout(State#state{confirm_timeout = undefined}) ->
+    {ok, Timeout} = timer:send_after(25, timeout),
+    State#state{confirm_timeout = Timeout};
+start_confirm_timeout(State) -> State.
+
 client_confirm(CRef, MsgIds, ActionTaken, State) ->
     #state { clients = Clients} = State,
-    case dict:fetch(CRef, Clients) of
+    case maps:get(CRef, Clients, none) of
         {_CPid, undefined, _CloseFDsFun}    ->
             State;
         {_CPid, MsgOnDiskFun, _CloseFDsFun} ->
             MsgOnDiskFun(MsgIds, ActionTaken),
-            State
+            State;
+        none -> State
     end.
 
