@@ -536,7 +536,7 @@ send_confirms(State = #state{client_written_confirms = CF, confirm_timeout = Tim
 stop_confirm_timeout(undefined) -> ok;
 stop_confirm_timeout(Timeout)   -> timer:cancel(Timeout), ok.
 
-start_confirm_timeout(State#state{confirm_timeout = undefined}) ->
+start_confirm_timeout(State = #state{confirm_timeout = undefined}) ->
     {ok, Timeout} = timer:send_after(25, timeout),
     State#state{confirm_timeout = Timeout};
 start_confirm_timeout(State) -> State.
