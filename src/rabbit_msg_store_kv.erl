@@ -14,7 +14,7 @@
 %% Copyright (c) 2007-2017 Pivotal Software, Inc.  All rights reserved.
 %%
 
--module(rabbit_msg_store_leveldb).
+-module(rabbit_msg_store_kv).
 
 -behaviour(rabbit_msg_store_behaviour).
 -export([start_link/4, successfully_recovered_state/1,
@@ -46,10 +46,8 @@
     credit_disc_bound}).
 
 -define(REFCOUNT_MODULE, rabbit_msg_store_ref_count_ets).
+-define(DB_MODULE, rabbit_eleveldb_store).
 -define(CLEAN_FILENAME, "clean.dot").
--define(READ_OPTIONS, []).
--define(WRITE_OPTIONS, []).
--define(OPEN_OPTIONS, [{create_if_missing, true}]).
 
 -include_lib("rabbit_common/include/rabbit.hrl").
 
@@ -153,13 +151,15 @@ init([Type, BaseDir, ClientRefs, StartupFunState]) ->
     process_flag(trap_exit, true),
     Dir = filename:join(BaseDir, atom_to_list(Type)),
     Name = filename:join(filename:basename(BaseDir), atom_to_list(Type)),
-    RefCountModule = application:get_env(rabbitmq_msg_store_eleveldb, ref_count_module, ?REFCOUNT_MODULE),
+    RefCountModule = application:get_env(rabbitmq_msg_store_kv, ref_count_module, ?REFCOUNT_MODULE),
+    DBModule = application:get_env(rabbitmq_msg_store_kv, db_module, ?DB_MODULE),
 
     rabbit_log:info("Message store ~tp: using ~p to provide reference counter~n", [Name, RefCountModule]),
+    rabbit_log:info("Message store ~tp: using ~p to provide storage~n", [Name, DBModule]),
 
     filelib:ensure_dir(filename:join(Dir, "nothing")),
 
-    DB = start_db(Dir),
+    DB = start_db(Dir, DBModule),
 
     {CleanShutdown, RefCountDB} =
         recover_ref_count(RefCountModule, DB, ClientRefs, Dir, StartupFunState, Name),
@@ -332,16 +332,15 @@ count_msg_refs(Gen, Seed, RefCountDB, DB) ->
             count_msg_refs(Gen, Next, RefCountDB, DB)
     end.
 
-clean_zero_count(RefCountDB, DB) ->
-    eleveldb:fold_keys(DB,
+clean_zero_count(RefCountDB, {DBModule, DBState} = DB) ->
+    DBModule:fold_keys(DBState,
         fun(MsgId, ok) ->
             case positive_ref_count(MsgId, RefCountDB) of
                 true  -> ok;
                 false -> ok = do_remove_message(MsgId, DB)
             end
         end,
-        ok,
-        ?READ_OPTIONS).
+        ok).
 
 store_recovery_terms(Terms, Dir) ->
     rabbit_file:write_term_file(filename:join(Dir, ?CLEAN_FILENAME), Terms).
@@ -475,12 +474,12 @@ server_cast(#client_state { server = Server }, Msg) ->
 %% DB functions
 %% ====================================
 
-start_db(Dir) ->
-    {ok, DbRef} = eleveldb:open(Dir, open_options()),
-    DbRef.
+start_db(Dir, DBModule) ->
+    {ok, DbRef} = DBModule:open(Dir),
+    {DBModule, DbRef}.
 
-stop_db(DB, Dir) ->
-    case eleveldb:close(DB) of
+stop_db({DBModule, DBState}, Dir) ->
+    case DBModule:close(DBState) of
         ok           -> ok;
         {error, Err} ->
             rabbit_log:error("Unable to stop message store"
@@ -489,33 +488,26 @@ stop_db(DB, Dir) ->
             error(Err)
     end.
 
-message_exists(MsgId, MsgDb) ->
-    case eleveldb:get(MsgDb, MsgId, ?READ_OPTIONS) of
-        not_found -> false;
-        {ok, _}   -> true;
+message_exists(MsgId, {DBModule, DBState}) ->
+    case DBModule:exists(DBState, MsgId) of
+        false -> false;
+        true  -> true;
         {error, Err} -> error(Err)
     end.
 
-do_read_message(MsgId, MsgDb) ->
-    case eleveldb:get(MsgDb, MsgId, ?READ_OPTIONS) of
+do_read_message(MsgId, {DBModule, DBState}) ->
+    case DBModule:get(DBState, MsgId) of
         not_found    -> not_found;
         {ok, Val}    -> {ok, binary_to_term(Val)};
         {error, Err} -> error(Err)
     end.
 
-do_write_message(MsgId, Msg, MsgDb) ->
+do_write_message(MsgId, Msg, {DBModule, DBState}) ->
     Val = term_to_binary(Msg),
-    ok = eleveldb:put(MsgDb, MsgId, Val, ?WRITE_OPTIONS).
+    ok = DBModule:put(DBState, MsgId, Val).
 
-do_remove_message(MsgId, MsgDb) ->
-    ok = eleveldb:delete(MsgDb, MsgId, ?WRITE_OPTIONS).
-
-open_options() ->
-    lists:ukeymerge(1,
-                    application:get_env(rabbit,
-                                        eleveldb_open_options,
-                                        []),
-                    ?OPEN_OPTIONS).
+do_remove_message(MsgId, {DBModule, DBState}) ->
+    ok = DBModule:delete(DBState, MsgId).
 
 record_client_confirm(CRef, MsgId, State = #state{client_written_confirms = CF}) ->
     CF1 = maps:update_with(CRef, fun(MsgIds) -> gb_sets:add(MsgId, MsgIds) end,
